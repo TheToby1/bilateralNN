@@ -16,6 +16,8 @@
 #include "caffe/util/math_functions.hpp"
 #include "caffe/util/new_math_utils.hpp"
 
+#include <unordered_map>
+
 namespace caffe {
 
 namespace permutohedral {
@@ -628,6 +630,66 @@ void Permutohedral<T>::map_back(
   assert(std::abs(sum - key[0]) < 1e-3);
 }
 
+struct keyHelper{
+  std::vector<boost::int16_t> key;
+  std::size_t key_size;
+
+  keyHelper(boost::int16_t *key, std::size_t key_size):
+    key_size(key_size) {
+      for(int i = 0; i<key_size; i++){
+        this->key.push_back(key[i]);
+      }
+    }
+  // bool operator==(const keyHelper& rhs) {
+  //   for(std::size_t i = 0; i < key_size; i++){
+  //     if(key[i] != rhs.key[i]){
+  //       return false;
+  //     }
+  //   }
+  //   return true;
+  // }
+};
+
+bool operator==(const keyHelper& lhs, const keyHelper& rhs) {
+    for(std::size_t i = 0; i < lhs.key_size; i++){
+      // std::cout << lhs.key[i] << ":" << rhs.key[i] << std::endl;
+      if(lhs.key[i] != rhs.key[i]){
+        // std::cout << "Diff keys" << std::endl;
+        return false;
+      }
+    }
+    return true;
+  }
+
+#include <functional>
+
+// namespace std
+// {
+//     template<> struct hash<keyHelper>
+//     {
+//         typedef keyHelper argument_type;
+//         typedef std::size_t result_type;
+//         result_type operator()(argument_type const& s) const noexcept
+//         {
+//             result_type const h1 ( std::hash<boost::int16_t *>{}(s.key) );
+//             return h1; // or use boost::hash_combine (see Discussion)
+//         }
+//     };
+// }
+
+struct MyHash
+{
+    std::size_t operator()(keyHelper const& s) const noexcept
+    {
+      size_t r = 0;
+      for ( size_t i = 0; i < s.key_size; i++ ) {
+        r += s.key[i];
+        r *= 1664525;
+      }
+      return r;
+    }
+};
+ 
 
 template <typename T>
 void Permutohedral<T>::init(
@@ -652,7 +714,11 @@ void Permutohedral<T>::init(
 
   // Compute the lattice coordinates for each feature [there is going to be
   // a lot of magic here
-  HashTable hash_table(d, N*(d+1));
+  // HashTable hash_table(d, N*(d+1));
+  typedef HT::CPU::sequential::robin_hood_unordered_map<keyHelper, std::size_t, MyHash> fast_table;
+  fast_table hash_table_fast(N*(d+1), 0.85);
+
+  std::unordered_map<keyHelper, std::size_t, MyHash> hash_table_real; 
 
   // Allocate the local memory
   std::vector<float> scale_factor(d);
@@ -680,104 +746,120 @@ void Permutohedral<T>::init(
 
   std::vector<boost::int16_t> min_key(d + 1);
   std::vector<boost::int16_t> max_key(d + 1);
-
+  std::size_t filled = 0;
   // Compute the simplex each feature lies in
-  for (int k = 0; k < N; k++) {
-    // Elevate the feature ( y = Ep, see p.5 in [Adams etal 2010])
-    // const value_type * f = feature + k*feature_size;
+  {
+    for (int k = 0; k < N; k++) {
+      // Elevate the feature ( y = Ep, see p.5 in [Adams etal 2010])
+      // const value_type * f = feature + k*feature_size;
 
-    // sm contains the sum of 1..n of our faeture vector
-    value_type sm(0);
-    for (int j = d; j > 0; j--) {
-      const int fIndex = (j-1)*N + k;
-      value_type cf = f[fIndex]*scale_factor[j-1];
-      elevated[j] = sm - j*cf;
-      sm += cf;
-    }
-    elevated[0] = sm;
-
-    // Find the closest 0-colored simplex through rounding
-    float down_factor = 1.0f / (d+1);
-    float up_factor = (d+1);
-    int sum = 0;
-    for (int i = 0; i <= d; i++) {
-      int rd = round(down_factor * static_cast<float>(elevated[i]));
-      rem0[i] = rd*up_factor;
-      sum += rd;
-    }
-
-    // Find the simplex we are in and store it in rank (where rank
-    // describes what position coorinate i has in the sorted order of the
-    // features values)
-    boost::int16_t* rank = ranks.data() + (d+1)*k;
-    for (int i = 0; i < d; i++) {
-      double di = static_cast<float>(elevated[i]) - rem0[i];
-      for (int j = i+1; j <= d; j++)
-        if ( di < static_cast<float>(elevated[j]) - rem0[j])
-          rank[i]++;
-        else
-          rank[j]++;
-    }
-
-    // If the point doesn't lie on the plane (sum != 0) bring it back
-    for (int i = 0; i <= d; i++) {
-      rank[i] += sum;
-      if ( rank[i] < 0 ) {
-        rank[i] += d+1;
-        rem0[i] += d+1;
-      } else if ( rank[i] > d ) {
-        rank[i] -= d+1;
-        rem0[i] -= d+1;
+      // sm contains the sum of 1..n of our feature vector
+      value_type sm(0);
+      for (int j = d; j > 0; j--) {
+        const int fIndex = (j-1)*N + k;
+        value_type cf = f[fIndex]*scale_factor[j-1];
+        elevated[j] = sm - j*cf;
+        sm += cf;
       }
-    }
+      elevated[0] = sm;
 
-    // If do_visualization is true, fill barycentric weights with 1.0
-    // Otherwise, comptue the barycentric coordinates (p.10 in [Adams et al. 2010])
-    if (do_visualization){
-      for (int i = 0; i <= d+1; i++){
-        barycentric[i] = 1.0;
+      // Find the closest 0-colored simplex through rounding
+      float down_factor = 1.0f / (d+1);
+      float up_factor = (d+1);
+      int sum = 0;
+      for (int i = 0; i <= d; i++) {
+        int rd = round(down_factor * static_cast<float>(elevated[i]));
+        rem0[i] = rd*up_factor;
+        sum += rd;
       }
-    }
-    else{
-      for (int i = 0; i <=d+1; i++)
-        barycentric[i] = 0;
-      for (int i = 0; i <=d; i++) {
-        value_type v = (elevated[i] - rem0[i])*down_factor;
 
-        if (d-rank[i] < 0 || d-rank[i]+1 >= d+2)
-          throw std::runtime_error("Permutohedral: rank access error");
-
-        // assert(d_-rank[i]   >= 0);
-        // assert(d_-rank[i]+1 <  d_+2);
-        barycentric[d-rank[i]  ] += v;
-        barycentric[d-rank[i]+1] -= v;
+      // Find the simplex we are in and store it in rank (where rank
+      // describes what position co-ordinate i has in the sorted order of the
+      // features values)
+      boost::int16_t* rank = ranks.data() + (d+1)*k;
+      for (int i = 0; i < d; i++) {
+        double di = static_cast<float>(elevated[i]) - rem0[i];
+        for (int j = i+1; j <= d; j++)
+          if ( di < static_cast<float>(elevated[j]) - rem0[j])
+            rank[i]++;
+          else
+            rank[j]++;
       }
-      // Wrap around
-      barycentric[0] += 1.0 + barycentric[d+1];
-    }
 
-    // Compute all vertices and their offset
-    std::vector<boost::int16_t> neighborKeyUp(d + 1);
-    std::vector<boost::int16_t> neighborKeyDown(d + 1);
-    for (int remainder = 0; remainder <= d; remainder++) {
-      for (int i = 0; i <d; i++)
-        key[i] = rem0[i] + canonical[ remainder*(d+1) + rank[i] ];
-      assert(k*(d+1)+remainder < (d+1) * N);
-      lattice->offset_[k*(d+1)+remainder] = hash_table.find(key.data(),
-                                                              true);
-      lattice->barycentric_[k*(d+1)+remainder] = barycentric[remainder];
+      // If the point doesn't lie on the plane (sum != 0) bring it back
+      for (int i = 0; i <= d; i++) {
+        rank[i] += sum;
+        if ( rank[i] < 0 ) {
+          rank[i] += d+1;
+          rem0[i] += d+1;
+        } else if ( rank[i] > d ) {
+          rank[i] -= d+1;
+          rem0[i] -= d+1;
+        }
+      }
 
-      // Gather the extent statistics of the lattice.
-      for (int j = 0; j < d; ++j) {
-        min_key[j] = (std::min)(key[j], min_key[j]);
-        max_key[j] = (std::max)(key[j], max_key[j]);
+      // If do_visualization is true, fill barycentric weights with 1.0
+      // Otherwise, comptue the barycentric coordinates (p.10 in [Adams et al. 2010])
+      if (do_visualization){
+        for (int i = 0; i <= d+1; i++){
+          barycentric[i] = 1.0;
+        }
+      }
+      else{
+        for (int i = 0; i <=d+1; i++)
+          barycentric[i] = 0;
+        for (int i = 0; i <=d; i++) {
+          value_type v = (elevated[i] - rem0[i])*down_factor;
+
+          if (d-rank[i] < 0 || d-rank[i]+1 >= d+2)
+            throw std::runtime_error("Permutohedral: rank access error");
+
+          // assert(d_-rank[i]   >= 0);
+          // assert(d_-rank[i]+1 <  d_+2);
+          barycentric[d-rank[i]  ] += v;
+          barycentric[d-rank[i]+1] -= v;
+        }
+        // Wrap around
+        barycentric[0] += 1.0 + barycentric[d+1];
+      }
+
+      // Compute all vertices and their offset
+      std::vector<boost::int16_t> neighborKeyUp(d + 1);
+      std::vector<boost::int16_t> neighborKeyDown(d + 1);
+      for (int remainder = 0; remainder <= d; remainder++) {
+        for (int i = 0; i <d; i++)
+          key[i] = rem0[i] + canonical[ remainder*(d+1) + rank[i] ];
+        assert(k*(d+1)+remainder < (d+1) * N);
+        // lattice->offset_[k*(d+1)+remainder] = hash_table.find(key.data(),
+        //                                                          true);
+
+        std::pair<fast_table::iterator, bool> res = hash_table_fast.insert(std::make_pair(keyHelper(key.data(), d), filled));
+
+        // auto res = hash_table_real.insert(std::make_pair(keyHelper(key.data(), d), filled));
+        if(res.second) {
+          lattice->offset_[k*(d+1)+remainder] = filled++;
+        }
+        else{
+          lattice->offset_[k*(d+1)+remainder] = res.first->second;
+        }
+        
+        lattice->barycentric_[k*(d+1)+remainder] = barycentric[remainder];
+
+        // Gather the extent statistics of the lattice.
+        for (int j = 0; j < d; ++j) {
+          min_key[j] = (std::min)(key[j], min_key[j]);
+          max_key[j] = (std::max)(key[j], max_key[j]);
+        }
       }
     }
   }
 
   // Find the Neighbors of each lattice point
   // Get the number of vertices in the lattice
-  const int M = hash_table.size();
+  // std::cout << "Size: " << hash_table.size() << std::endl;
+  // std::cout << "Filled: " << filled << std::endl;
+
+  const int M = hash_table_fast.size();
   lattice->M_ = M;
 
   // Gather some debug information.
@@ -801,13 +883,26 @@ void Permutohedral<T>::init(
 
   //  extract (d+1) x M matrix of immediate neighbour indices         row-major
   std::vector<int> immediate_neighbors((d+1)*M);
-  for (int i = 0; i < M; ++i) {
-    const boost::int16_t * key = hash_table.getKey(i);
+  for (auto it = hash_table_fast.begin(); it!= hash_table_fast.end(); it++) {
+    // const boost::int16_t * key = hash_table.getKey(i);
+    const boost::int16_t * key = it->first.key.data();
+
     for (int dim = 0; dim <= d; ++dim) {
       std::copy(key, key + d+1, walking_key.begin());
       advance_in_dimension(dim, 1, &walking_key);
-      immediate_neighbors[i + M*dim] =
-        hash_table.find(walking_key.data(), false);
+      keyHelper test(walking_key.data(), d);
+      auto res = hash_table_fast.find(test);
+
+      if(res==hash_table_fast.end()){
+        immediate_neighbors[it->second + M*dim] = -1;
+      }
+      else{
+        immediate_neighbors[it->second + M*dim] =
+          res->second;
+      }
+
+      // immediate_neighbors[it->second + M*dim] =
+      //   hash_table.find(walking_key.data(), false);
     }
   }
   assert(immediate_neighbors.size() == (M*(d+1)));

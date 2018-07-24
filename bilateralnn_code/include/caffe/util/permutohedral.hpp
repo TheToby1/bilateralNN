@@ -18,6 +18,8 @@
 
 #include "caffe/blob.hpp"
 
+#include "cpu_unordered_map.h"
+
 namespace caffe {
 
 namespace permutohedral {

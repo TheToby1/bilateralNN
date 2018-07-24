@@ -150,7 +150,7 @@ void PermutohedralLayerTemplate<Dtype, Ptype>::InitLattice(
     if (in_lattice_blob)
       in_lattice_blob_data = in_lattice_blob->cpu_data();
 
-#pragma omp parallel
+    #pragma omp parallel
     {
       std::vector<Dtype> feature(feature_size_ * data_count);
 
