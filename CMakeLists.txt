@@ -131,10 +131,10 @@ ExternalProject_Add(
   LOG_INSTALL 1
   )
 
-add_custom_target(
-  runtest
-  COMMAND ${CMAKE_COMMAND} --build bin --target runtest
-  DEPENDS CaffeUpstream
-)
+# add_custom_target(
+#   runtest
+#   COMMAND ${CMAKE_COMMAND} --build bin --target runtest
+#   DEPENDS CaffeUpstream
+# )
 
 #add_subdirectory(${CAFFE_DIRECTORY} caffe_tmp)
